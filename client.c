@@ -6,6 +6,9 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <strings.h>
+#include <string.h>
+
+#define BUFF_SIZE 1024
 
 static uint create_client_socket(void)
 {
@@ -45,6 +48,7 @@ int main(int argc, char **argv)
     socklen_t addrlen = sizeof(server_address);
     const char *ip = NULL;
     uint port;
+	char buffer[BUFF_SIZE] = {0};
 
     if (argc != 3) {
         fprintf(stderr, "Uso: %s <server-ip> <port>\n", argv[0]);
@@ -57,6 +61,18 @@ int main(int argc, char **argv)
     socket_fd = create_client_socket();
     configure_server_address(&server_address, ip, port);
     connect_to_server(socket_fd, &server_address, addrlen);
+
+	for( ; ; ) {
+		printf("You: ");
+		fgets(buffer, BUFF_SIZE, stdin);
+
+		send(socket_fd, buffer, strlen(buffer), 0);
+
+		if(strcmp(buffer, "/exit\n") == 0) {
+			printf("EXITED");
+			break;
+		}
+	}
 
     close(socket_fd);
     return EXIT_SUCCESS;

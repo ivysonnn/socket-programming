@@ -1,4 +1,5 @@
 #include <netinet/in.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -8,9 +9,15 @@
 #include <strings.h>
 #include <time.h>
 #include <string.h>
+#include <pthread.h>
 
-#define BACKLOG 5
 #define TIMESTAMP_SIZE 20
+#define MAX_CLIENTS 8
+#define BUFFER_SIZE 1024
+
+uint clients_sock[MAX_CLIENTS] = {0};
+pthread_mutex_t client_mut = PTHREAD_MUTEX_INITIALIZER;
+
 
 static void get_timestamp(char *timestamp, size_t size)
 {
@@ -48,23 +55,29 @@ static void bind_server_socket(uint server_fd, struct sockaddr_in *server_addres
 
 static void listen_server_socket(uint server_fd)
 {
-    if (listen(server_fd, BACKLOG) < 0) {
+    if (listen(server_fd, MAX_CLIENTS) < 0) {
         perror("listen failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
 }
 
-static int accept_client_connection(uint server_fd,
-                                   struct sockaddr_in *client_address,
-                                   socklen_t *client_addrlen,
-                                   char *client_ip)
+static int accept_client_connection(uint server_fd, struct sockaddr_in *client_address, socklen_t *client_addrlen, char *client_ip)
 {
     int new_socket_fd = accept(server_fd, (struct sockaddr *)client_address, client_addrlen);
     if (new_socket_fd < 0) {
         perror("accepting failed");
         return -1;
     }
+
+	pthread_mutex_lock(&client_mut);
+	for(uint i = 0; i < MAX_CLIENTS; i++) {
+		if(clients_sock[i] == 0) {
+			clients_sock[i] = new_socket_fd;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&client_mut);
 
     if (inet_ntop(AF_INET, &client_address->sin_addr, client_ip, INET_ADDRSTRLEN) == NULL) {
         perror("error converting client address");
@@ -87,24 +100,69 @@ static void log_client_connected(const char *client_ip, int client_port, int cli
 {
     char timestamp[TIMESTAMP_SIZE];
     get_timestamp(timestamp, sizeof(timestamp));
-    printf("[%s] client connected: %s:%d (fd %d)\n",
-           timestamp, client_ip, client_port, client_fd);
+    printf("[%s] client connected: %s:%d (fd %d)\n", timestamp, client_ip, client_port, client_fd);
     fflush(stdout);
 }
 
-static void handle_client(int client_fd) // messaging part for later
+static void broadcast(char* msg, uint sender_sock)
 {
-    shutdown(client_fd, SHUT_RDWR);
-    close(client_fd);
+	pthread_mutex_lock(&client_mut);
+	for(uint i = 0; i < MAX_CLIENTS; i++) {
+		if(clients_sock[i] !=0 && clients_sock[i] != sender_sock) {
+			send(clients_sock[i], msg, strlen(msg), 0);
+		}
+	}
+	pthread_mutex_unlock(&client_mut);
+}
+
+static void* handle_client(void* client_fd) // this weird cause needs to be a function pointer to pass to pthread_create
+{
+	uint sock = *(uint*)client_fd;
+	char buffer[BUFFER_SIZE] = {0};
+	uint valread;
+	char timestamp[TIMESTAMP_SIZE];
+
+	while((valread = read(sock, buffer, BUFFER_SIZE)) > 0) {
+		buffer[valread] = '\0';
+		char buff[sizeof(buffer)];
+		strcpy(buff, buffer);
+		buff[strcspn(buff, "\n")] = '\0';
+		
+		
+		if (strcmp(buffer, "exit\n") == 0) {
+			get_timestamp(timestamp, sizeof(timestamp));
+            printf("[%s] client disconnected: fd %d\n", timestamp, sock);
+            break;
+        }
+
+		get_timestamp(timestamp, sizeof(timestamp));
+		printf("[%s] received '%s' from fd %d\n", timestamp, buff, sock);
+		broadcast(buffer, sock);
+	}
+
+	pthread_mutex_lock(&client_mut);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients_sock[i] == sock) {
+            clients_sock[i] = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&client_mut);
+
+	close(sock);
+	free(client_fd);
+
+	return NULL;
 }
 
 int main(int argc, char **argv)
 {
-    uint server_fd, new_socket_fd;
+    int server_fd, new_socket_fd;
     struct sockaddr_in server_address;
     struct sockaddr_in client_address;
     socklen_t addrlen = sizeof(server_address);
     socklen_t client_addrlen;
+	pthread_t thread_id;
     uint port;
     char client_ip[INET_ADDRSTRLEN];
 
@@ -126,15 +184,21 @@ int main(int argc, char **argv)
     for (;;) {
         client_addrlen = sizeof(client_address);
         new_socket_fd = accept_client_connection(server_fd, &client_address, &client_addrlen, client_ip);
-
         if (new_socket_fd < 0) {
             continue;
         }
-
         log_client_connected(client_ip, ntohs(client_address.sin_port), new_socket_fd);
-        handle_client(new_socket_fd);
-    }
+    
+		uint *new_sock = malloc(sizeof(int));
+		*new_sock = new_socket_fd;
 
+		if(pthread_create(&thread_id, NULL, handle_client, (void*)new_sock) < 0) {
+			perror("error creating thread");
+			return EXIT_FAILURE;
+		}
+
+		pthread_detach(thread_id);
+	}
     close(server_fd);
     return EXIT_SUCCESS;
 }
